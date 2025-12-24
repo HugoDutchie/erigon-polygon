@@ -66,6 +66,9 @@ var (
 	mxMgas = metrics.NewGauge(`exec_mgas`)
 )
 
+// Track II prune mode for logging only on transitions
+var lastIIPruneMode string
+
 const (
 	maxUnwindJumpAllowance = 1000 // Maximum number of blocks we are allowed to unwind
 )
@@ -764,11 +767,45 @@ Loop:
 
 				// allow greedy prune on non-chain-tip
 				pruneTimeout := 250 * time.Millisecond
+				iiPruneMode := "normal"
 				if initialCycle {
 					pruneTimeout = 10 * time.Hour
+					iiPruneMode = "initialCycle"
 
 					if err = executor.tx().(kv.TemporalRwTx).GreedyPruneHistory(ctx, kv.CommitmentDomain); err != nil {
 						return err
+					}
+				} else {
+					// Check for II backlog - enable aggressive prune if needed
+					iiBacklog, blockedIIs := aggregatorRo.IIBacklogInfo(executor.tx())
+					if len(blockedIIs) > 0 {
+						iiPruneMode = "blocked"
+					} else if iiBacklog > 10_000_000 { // >10M txNums behind (~500 steps)
+						pruneTimeout = 30 * time.Minute
+						iiPruneMode = "aggressive"
+					} else if iiBacklog > 1_000_000 { // >1M txNums behind (~50 steps)
+						pruneTimeout = 10 * time.Minute
+						iiPruneMode = "medium"
+					}
+				}
+
+				// Log only on mode transitions
+				if iiPruneMode != lastIIPruneMode {
+					prevMode := lastIIPruneMode
+					lastIIPruneMode = iiPruneMode
+					switch iiPruneMode {
+					case "blocked":
+						iiBacklog, blockedIIs := aggregatorRo.IIBacklogInfo(executor.tx())
+						logger.Warn("[OtterSync] II prune blocked - no visible files",
+							"blockedIIs", blockedIIs, "backlog", iiBacklog)
+					case "aggressive":
+						logger.Info("[OtterSync] II prune backlog: aggressive", "timeout", pruneTimeout)
+					case "medium":
+						logger.Info("[OtterSync] II prune backlog: medium", "timeout", pruneTimeout)
+					case "normal":
+						if prevMode == "aggressive" || prevMode == "medium" || prevMode == "blocked" {
+							logger.Info("[OtterSync] II prune backlog: off")
+						}
 					}
 				}
 
