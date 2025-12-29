@@ -66,8 +66,9 @@ var (
 	mxMgas = metrics.NewGauge(`exec_mgas`)
 )
 
-// Track II prune mode for logging only on transitions
+// Track prune modes for logging only on transitions
 var lastIIPruneMode string
+var lastCommitmentPruneMode string
 
 const (
 	maxUnwindJumpAllowance = 1000 // Maximum number of blocks we are allowed to unwind
@@ -786,6 +787,30 @@ Loop:
 					} else if iiBacklog > 1_000_000 { // >1M txNums behind (~50 steps)
 						pruneTimeout = 10 * time.Minute
 						iiPruneMode = "medium"
+					}
+
+					// Check for CommitmentDomain history backlog - call GreedyPruneHistory if behind
+					commitmentBacklog := aggregatorRo.CommitmentBacklogInfo(executor.tx())
+					commitmentPruneMode := "normal"
+					if commitmentBacklog > 10_000_000 { // >10M txNums behind
+						commitmentPruneMode = "aggressive"
+						if err = executor.tx().(kv.TemporalRwTx).GreedyPruneHistory(ctx, kv.CommitmentDomain); err != nil {
+							return err
+						}
+					}
+
+					// Log commitment prune mode transitions
+					if commitmentPruneMode != lastCommitmentPruneMode {
+						prevMode := lastCommitmentPruneMode
+						lastCommitmentPruneMode = commitmentPruneMode
+						switch commitmentPruneMode {
+						case "aggressive":
+							logger.Info("[OtterSync] Commitment prune backlog: aggressive", "backlog", commitmentBacklog)
+						case "normal":
+							if prevMode == "aggressive" {
+								logger.Info("[OtterSync] Commitment prune backlog: off")
+							}
+						}
 					}
 				}
 
